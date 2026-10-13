@@ -385,10 +385,19 @@ class FPSUnlockerApp:
                  bg=Colors.BG_CARD, fg=Colors.TEXT_DIM).pack(side="left")
 
         self.target_fps_var = tk.StringVar(value="Unlimited (-1)")
-        fps_options = ["Unlimited (-1)", "120", "144", "165", "240", "360"]
+        fps_options = ["Unlimited (-1)", "120", "144", "165", "240", "360", "500", "1000"]
         fps_combo = ttk.Combobox(fps_frame, textvariable=self.target_fps_var,
                                   values=fps_options, state="readonly", width=18)
         fps_combo.pack(side="left", padx=(8, 0))
+
+        # Keep-alive option
+        self.keepalive_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(card_inner, variable=self.keepalive_var, bg=Colors.BG_CARD,
+                       fg=Colors.TEXT, selectcolor=Colors.BG_INPUT,
+                       activebackground=Colors.BG_CARD, activeforeground=Colors.TEXT,
+                       font=("Segoe UI", 10), anchor="w",
+                       text="🔁 Keep unlocked (re-apply automatically if the game resets it)"
+                       ).pack(fill="x", pady=(0, 8))
 
         # Game status
         status_frame = tk.Frame(card_inner, bg=Colors.BG_CARD)
@@ -401,6 +410,15 @@ class FPSUnlockerApp:
                                            font=("Segoe UI Semibold", 10),
                                            bg=Colors.BG_CARD, fg=Colors.TEXT_MUTED)
         self.game_status_label.pack(side="left", padx=(8, 0))
+
+        # Current cap
+        cap_frame = tk.Frame(card_inner, bg=Colors.BG_CARD)
+        cap_frame.pack(fill="x", pady=(0, 8))
+        tk.Label(cap_frame, text="Current FPS Cap:", font=("Segoe UI", 10),
+                 bg=Colors.BG_CARD, fg=Colors.TEXT_DIM).pack(side="left")
+        self.cap_label = tk.Label(cap_frame, text="—", font=("Segoe UI Semibold", 10),
+                                  bg=Colors.BG_CARD, fg=Colors.TEXT_MUTED)
+        self.cap_label.pack(side="left", padx=(8, 0))
 
         # Patch button
         btn_frame = tk.Frame(card_inner, bg=Colors.BG_CARD)
@@ -421,10 +439,10 @@ class FPSUnlockerApp:
 
         steps = [
             "1. Finds the running SCPSL.exe process",
-            "2. Locates UnityPlayer.dll in process memory",
-            "3. Scans for the frame rate cap value (60)",
-            "4. Patches it to your target FPS or unlimited",
-            "5. The patch lasts until the game is restarted",
+            "2. Locates Unity's internal-call table inside UnityPlayer.dll",
+            "3. Decodes Application.get_targetFrameRate to find the exact FPS cap",
+            "4. Writes your target FPS (or -1 = unlimited) to that single value",
+            "5. Keep-alive re-applies it if the game resets it; lasts until restart",
         ]
         for step in steps:
             tk.Label(card_inner2, text=step, font=("Segoe UI", 10),
@@ -669,17 +687,35 @@ class FPSUnlockerApp:
     # ── Advanced ─────────────────────────────────────────────────────────
 
     def _check_game_status(self):
-        """Check if the game is currently running."""
+        """Check if the game is currently running and read the current FPS cap."""
         def run():
             is_running = self.memory_patcher.is_game_running()
             if is_running:
                 self.root.after(0, lambda: self.game_status_label.config(
                     text="🟢 Game is running", fg=Colors.ACCENT_GREEN))
+                try:
+                    cap = self.memory_patcher.read_current_cap()
+                except Exception:
+                    cap = None
+                self.root.after(0, lambda: self._show_cap(cap))
             else:
                 self.root.after(0, lambda: self.game_status_label.config(
                     text="🔴 Game is not running", fg=Colors.ACCENT_RED))
+                self.root.after(0, lambda: self.cap_label.config(
+                    text="—", fg=Colors.TEXT_MUTED))
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _show_cap(self, cap):
+        """Render the current FPS cap value."""
+        if cap is None:
+            self.cap_label.config(text="Unknown", fg=Colors.TEXT_MUTED)
+        elif cap < 0 or cap > 1000:
+            self.cap_label.config(text=f"Unlimited ({cap}) ✅", fg=Colors.ACCENT_GREEN)
+        elif cap <= 60:
+            self.cap_label.config(text=f"{cap} FPS — locked ❌", fg=Colors.ACCENT_RED)
+        else:
+            self.cap_label.config(text=f"{cap} FPS", fg=Colors.ACCENT_GREEN)
 
     def _apply_memory_patch(self):
         """Apply the runtime memory patch."""
@@ -718,6 +754,9 @@ class FPSUnlockerApp:
                     tag))
                 if result.success:
                     self.root.after(0, lambda: self.set_status("✅ FPS patch applied!"))
+                    self.root.after(0, lambda: self._show_cap(target_fps))
+                    if self.keepalive_var.get():
+                        self.memory_patcher.start_keepalive(target_fps)
                 else:
                     self.root.after(0, lambda: self.set_status(f"❌ {result.message}"))
             except Exception as e:

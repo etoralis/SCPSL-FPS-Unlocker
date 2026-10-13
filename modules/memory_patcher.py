@@ -11,6 +11,7 @@ import ctypes
 import ctypes.wintypes
 import struct
 import subprocess
+import threading
 from dataclasses import dataclass
 from typing import Optional, Callable
 
@@ -131,6 +132,11 @@ kernel32.Module32FirstW.restype = ctypes.c_bool
 kernel32.Module32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MODULEENTRY32W)]
 kernel32.Module32NextW.restype = ctypes.c_bool
 
+kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+kernel32.GetExitCodeProcess.restype = ctypes.c_bool
+
+STILL_ACTIVE = 259
+
 
 # ─── Data Classes ────────────────────────────────────────────────────────────
 @dataclass
@@ -147,17 +153,22 @@ class MemoryPatcher:
     """Runtime memory patcher for Unity FPS unlock."""
 
     TARGET_PROCESS = "SCPSL.exe"
-    # Modules to scan for the frame rate cap value
-    TARGET_MODULES = ["UnityPlayer.dll", "GameAssembly.dll"]
-    # The value we're looking for (60 FPS cap)
-    SEARCH_VALUE = 60
-    # VSync count value often found near targetFrameRate
-    VSYNC_VALUE = 1
+    TARGET_MODULE = "UnityPlayer.dll"
+    # Unity internal-call names used to locate the targetFrameRate global
+    ICALL_GETTER = b"UnityEngine.Application::get_targetFrameRate"
+    ICALL_SETTER = b"UnityEngine.Application::set_targetFrameRate"
     # Chunk size for reading process memory
     CHUNK_SIZE = 65536  # 64 KB
+    # How often the keep-alive loop checks the value (seconds)
+    KEEPALIVE_INTERVAL = 1.5
 
     def __init__(self, log_callback: Optional[Callable[[str], None]] = None):
         self._log_callback = log_callback
+        # Cache: (pid, address) of the resolved targetFrameRate global
+        self._cached_pid: Optional[int] = None
+        self._cached_addr: Optional[int] = None
+        self._keepalive_stop: Optional[threading.Event] = None
+        self._keepalive_thread: Optional[threading.Thread] = None
 
     def _log(self, msg: str):
         """Log a message via the callback if available."""
@@ -287,6 +298,256 @@ class MemoryPatcher:
 
         return bool(success) and bytes_written.value == len(data)
 
+    # ── Address resolution ──────────────────────────────────────────────
+
+    def _read_module_image(self, handle: int, base: int, size: int) -> bytes:
+        """Read a whole module image from the target process."""
+        buf = bytearray(size)
+        offset = 0
+        while offset < size:
+            chunk = min(self.CHUNK_SIZE, size - offset)
+            data = self.read_memory(handle, base + offset, chunk)
+            if data:
+                buf[offset:offset + len(data)] = data
+            offset += chunk
+        return bytes(buf)
+
+    @staticmethod
+    def _decode_rip_access(image: bytes, func_off: int, opcode: int) -> Optional[int]:
+        """Decode `opcode r32, [rip+rel32]` at func_off (following one jmp).
+
+        Returns the module-relative offset of the referenced global, or None.
+        opcode: 0x8B for the getter (mov eax,[rip+x]), 0x89 for the setter.
+        """
+        for _ in range(2):
+            if func_off < 0 or func_off + 7 > len(image):
+                return None
+            b0 = image[func_off]
+            if b0 == 0xE9:  # jmp rel32 -> follow
+                rel = struct.unpack_from("<i", image, func_off + 1)[0]
+                func_off = func_off + 5 + rel
+                continue
+            if b0 == opcode and (image[func_off + 1] & 0xC7) == 0x05:
+                rel = struct.unpack_from("<i", image, func_off + 2)[0]
+                return func_off + 6 + rel
+            return None
+        return None
+
+    def _resolve_target_framerate(self, image: bytes, base: int) -> Optional[int]:
+        """Find the absolute address of Unity's targetFrameRate global.
+
+        Unity registers internal calls through two parallel tables inside
+        UnityPlayer.dll: a null-terminated table of name pointers followed by
+        a table of function pointers. The getter for targetFrameRate is a tiny
+        `mov eax, [rip+X]; ret`, so decoding it gives the exact address.
+        """
+        size = len(image)
+        name_off = image.find(self.ICALL_GETTER + b"\x00")
+        if name_off == -1:
+            self._log("  get_targetFrameRate icall name not found")
+            return None
+
+        # Find the 8-byte aligned pointer to the name string
+        needle = struct.pack("<Q", base + name_off)
+        entry = image.find(needle)
+        while entry != -1 and entry % 8 != 0:
+            entry = image.find(needle, entry + 1)
+        if entry == -1:
+            self._log("  icall name table not found")
+            return None
+
+        def qword(off: int) -> int:
+            return struct.unpack_from("<Q", image, off)[0]
+
+        def is_name_ptr(off: int) -> bool:
+            if off < 0 or off + 8 > size:
+                return False
+            rel = qword(off) - base
+            return 0 <= rel < size - 8 and image.startswith(b"Unity", rel)
+
+        start = entry
+        while is_name_ptr(start - 8):
+            start -= 8
+        end = entry
+        while is_name_ptr(end):
+            end += 8
+        index = (entry - start) // 8
+
+        # Function table follows the name table after its null terminator(s)
+        func_table = end
+        skipped = 0
+        while func_table + 8 <= size and qword(func_table) == 0 and skipped < 4:
+            func_table += 8
+            skipped += 1
+
+        candidates: list[int] = []
+        getter = qword(func_table + index * 8) - base
+        g = self._decode_rip_access(image, getter, 0x8B)
+        if g is not None:
+            candidates.append(g)
+
+        # Cross-check with the setter if it is the next entry
+        if is_name_ptr(end - 8) and index + 1 < (end - start) // 8:
+            next_name = qword(entry + 8) - base
+            if image.startswith(self.ICALL_SETTER + b"\x00", next_name):
+                setter = qword(func_table + (index + 1) * 8) - base
+                s = self._decode_rip_access(image, setter, 0x89)
+                if s is not None:
+                    if g is not None and s != g:
+                        self._log("  Getter/setter disagree, using getter")
+                    elif g is None:
+                        candidates.append(s)
+
+        for off in candidates:
+            if 0 <= off < size:
+                return base + off
+        self._log("  Could not decode targetFrameRate accessor")
+        return None
+
+    def _get_address(self, handle: int, pid: int) -> Optional[int]:
+        """Return the cached or freshly resolved targetFrameRate address."""
+        if self._cached_pid == pid and self._cached_addr:
+            return self._cached_addr
+        module_info = self.get_module_info(pid, self.TARGET_MODULE)
+        if module_info is None:
+            self._log(f"  {self.TARGET_MODULE} not found in process")
+            return None
+        base, size = module_info
+        self._log(f"  {self.TARGET_MODULE}: base=0x{base:X}, size={size / 1024 / 1024:.1f} MB")
+        image = self._read_module_image(handle, base, size)
+        addr = self._resolve_target_framerate(image, base)
+        if addr:
+            self._cached_pid, self._cached_addr = pid, addr
+            self._log(f"  targetFrameRate located at {self.TARGET_MODULE}+0x{addr - base:X}")
+        return addr
+
+    def _read_int(self, handle: int, addr: int) -> Optional[int]:
+        data = self.read_memory(handle, addr, 4)
+        if data and len(data) == 4:
+            return struct.unpack("<i", data)[0]
+        return None
+
+    def read_current_cap(self) -> Optional[int]:
+        """Read the game's current targetFrameRate (None if unavailable)."""
+        pid = self.find_process()
+        if pid is None:
+            return None
+        handle = kernel32.OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            addr = self._get_address(handle, pid)
+            return self._read_int(handle, addr) if addr else None
+        finally:
+            kernel32.CloseHandle(handle)
+
+    # ── Patching ────────────────────────────────────────────────────────
+
+    def unlock_fps(self, target_fps: int = -1) -> PatchResult:
+        """Set Unity's Application.targetFrameRate in the running game.
+
+        Args:
+            target_fps: The target FPS to set. -1 for unlimited.
+
+        Returns:
+            PatchResult with success status and details.
+        """
+        fps_label = "Unlimited" if target_fps < 0 else str(target_fps)
+
+        self._log("Step 1: Finding SCPSL.exe process...")
+        pid = self.find_process()
+        if pid is None:
+            return PatchResult(False, "SCPSL.exe process not found. Is the game running?")
+        self._log(f"  Found SCPSL.exe (PID: {pid})")
+
+        self._log("Step 2: Opening process...")
+        handle = kernel32.OpenProcess(PROCESS_ACCESS, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            return PatchResult(False, f"Failed to open process (Error: {error}). "
+                                      "Try running as Administrator.")
+
+        try:
+            self._log("Step 3: Locating targetFrameRate...")
+            addr = self._get_address(handle, pid)
+            if not addr:
+                return PatchResult(False, "Could not locate targetFrameRate in UnityPlayer.dll "
+                                          "(game engine layout changed).")
+
+            current = self._read_int(handle, addr)
+            self._log(f"  Current FPS cap: {current}")
+            if current is None or not (-1 <= current <= 10000):
+                self._cached_pid = self._cached_addr = None
+                return PatchResult(False, f"Unexpected value at target address ({current}); "
+                                          "aborting for safety.", addresses_found=1)
+
+            self._log(f"Step 4: Writing {fps_label}...")
+            if not self.write_memory(handle, addr, struct.pack("<i", target_fps)):
+                return PatchResult(False, "Failed to write memory. Try running as Administrator.",
+                                   addresses_found=1)
+
+            verify = self._read_int(handle, addr)
+            if verify != target_fps:
+                return PatchResult(False, f"Write did not stick (read back {verify}).",
+                                   addresses_found=1)
+
+            self._log(f"  ✅ FPS cap changed: {current} → {fps_label}")
+            return PatchResult(True, f"FPS cap changed from {current} to {fps_label}!",
+                               addresses_found=1, addresses_patched=1)
+        finally:
+            kernel32.CloseHandle(handle)
+
+    # ── Keep-alive ──────────────────────────────────────────────────────
+
+    def is_keepalive_running(self) -> bool:
+        return bool(self._keepalive_thread and self._keepalive_thread.is_alive())
+
+    def start_keepalive(self, target_fps: int = -1):
+        """Re-apply the FPS value whenever the game resets it (e.g. on settings/scene change)."""
+        self.stop_keepalive()
+        stop = threading.Event()
+        self._keepalive_stop = stop
+
+        def loop():
+            pid = self.find_process()
+            if pid is None:
+                return
+            handle = kernel32.OpenProcess(PROCESS_ACCESS, False, pid)
+            if not handle:
+                self._log("Keep-alive: failed to open process")
+                return
+            try:
+                addr = self._get_address(handle, pid)
+                if not addr:
+                    return
+                self._log("🔁 Keep-alive started — FPS cap will be re-applied if the game resets it")
+                packed = struct.pack("<i", target_fps)
+                exit_code = ctypes.c_uint(0)
+                while not stop.wait(self.KEEPALIVE_INTERVAL):
+                    if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)) \
+                            or exit_code.value != STILL_ACTIVE:
+                        self._log("Keep-alive: game closed, stopping")
+                        break
+                    value = self._read_int(handle, addr)
+                    if value is not None and value != target_fps:
+                        if self.write_memory(handle, addr, packed):
+                            self._log(f"🔁 Game reset FPS cap to {value} — re-applied")
+            finally:
+                kernel32.CloseHandle(handle)
+
+        self._keepalive_thread = threading.Thread(target=loop, daemon=True)
+        self._keepalive_thread.start()
+
+    def stop_keepalive(self):
+        if self._keepalive_stop:
+            self._keepalive_stop.set()
+        if self._keepalive_thread and self._keepalive_thread is not threading.current_thread():
+            self._keepalive_thread.join(timeout=3)
+        self._keepalive_thread = None
+        self._keepalive_stop = None
+
+    # ── Legacy helper (kept for API compatibility) ──────────────────────
+
     def scan_module_for_value(self, handle: int, base: int, size: int,
                               value: int, value_size: int = 4) -> list[int]:
         """Scan a module's memory region for a specific integer value.
@@ -320,164 +581,3 @@ class MemoryPatcher:
             scan_count += 1
 
         return found_addresses
-
-    def _score_candidate(self, handle: int, addr: int) -> int:
-        """Score a candidate address based on surrounding context.
-        
-        Higher score = more likely to be the actual targetFrameRate value.
-        Heuristics:
-        - VSync count (1) nearby → +10
-        - Other common quality values nearby → +5
-        - Value is in a data section (not code) → +3
-        """
-        score = 0
-
-        # Read surrounding memory (128 bytes before and after)
-        context_data = self.read_memory(handle, addr - 128, 256 + 4)
-        if not context_data:
-            return 0
-
-        # Look for vSyncCount value (1) as a 4-byte int nearby
-        vsync_bytes = struct.pack('<i', self.VSYNC_VALUE)
-        if vsync_bytes in context_data:
-            score += 10
-
-        # Look for common quality-related values
-        # -1 (unlimited fps marker) as int
-        neg_one = struct.pack('<i', -1)
-        if neg_one in context_data:
-            score += 3
-
-        # Look for 0 values (common in settings structures)
-        zero_bytes = struct.pack('<i', 0)
-        zero_count = context_data.count(zero_bytes)
-        if 2 <= zero_count <= 20:
-            score += 2
-
-        # Check that the surrounding area doesn't look like code
-        # (x86 code tends to have more varied byte values)
-        surrounding = context_data[:128] + context_data[132:]
-        unique_bytes = len(set(surrounding))
-        if unique_bytes < 100:  # Data sections tend to have less variety
-            score += 3
-
-        return score
-
-    def unlock_fps(self, target_fps: int = -1) -> PatchResult:
-        """Scan for and patch the FPS cap value in the running game.
-        
-        Args:
-            target_fps: The target FPS to set. -1 for unlimited.
-            
-        Returns:
-            PatchResult with success status and details.
-        """
-        # Step 1: Find the game process
-        self._log("Step 1: Finding SCPSL.exe process...")
-        pid = self.find_process()
-        if pid is None:
-            return PatchResult(False, "SCPSL.exe process not found. Is the game running?")
-        self._log(f"  Found SCPSL.exe (PID: {pid})")
-
-        # Step 2: Open the process
-        self._log("Step 2: Opening process...")
-        handle = kernel32.OpenProcess(PROCESS_ACCESS, False, pid)
-        if not handle:
-            error = ctypes.get_last_error()
-            return PatchResult(
-                False,
-                f"Failed to open process (Error: {error}). "
-                "Try running as Administrator."
-            )
-        self._log("  Process opened successfully")
-
-        try:
-            total_found = 0
-            total_patched = 0
-            best_candidates: list[tuple[int, int, str]] = []  # (address, score, module)
-
-            # Step 3: Scan each target module
-            for module_name in self.TARGET_MODULES:
-                self._log(f"Step 3: Scanning {module_name}...")
-                module_info = self.get_module_info(pid, module_name)
-
-                if module_info is None:
-                    self._log(f"  {module_name} not found in process, skipping")
-                    continue
-
-                base, size = module_info
-                self._log(f"  {module_name}: base=0x{base:X}, size={size / 1024 / 1024:.1f} MB")
-
-                # Scan for the value 60
-                self._log(f"  Scanning for value {self.SEARCH_VALUE}...")
-                addresses = self.scan_module_for_value(handle, base, size, self.SEARCH_VALUE)
-                self._log(f"  Found {len(addresses)} occurrences of {self.SEARCH_VALUE}")
-                total_found += len(addresses)
-
-                # Score each candidate
-                self._log("  Scoring candidates...")
-                for addr in addresses:
-                    score = self._score_candidate(handle, addr)
-                    if score >= 5:  # Only consider reasonably scored candidates
-                        best_candidates.append((addr, score, module_name))
-
-            if not best_candidates:
-                # Fallback: try broader memory scan if module scan found nothing good
-                self._log("  No high-confidence candidates found in modules")
-                self._log("  Attempting broader scan of UnityPlayer.dll with lower threshold...")
-
-                module_info = self.get_module_info(pid, "UnityPlayer.dll")
-                if module_info:
-                    base, size = module_info
-                    addresses = self.scan_module_for_value(handle, base, size, self.SEARCH_VALUE)
-                    for addr in addresses:
-                        score = self._score_candidate(handle, addr)
-                        if score >= 2:
-                            best_candidates.append((addr, score, "UnityPlayer.dll"))
-
-            if not best_candidates:
-                return PatchResult(
-                    False,
-                    f"Could not find FPS cap value in game memory. "
-                    f"Total occurrences of {self.SEARCH_VALUE}: {total_found}, "
-                    f"but none matched the expected pattern.",
-                    addresses_found=total_found
-                )
-
-            # Sort by score (highest first)
-            best_candidates.sort(key=lambda x: x[1], reverse=True)
-
-            # Step 4: Patch the top candidates
-            target_bytes = struct.pack('<i', target_fps)
-            fps_label = "Unlimited" if target_fps < 0 else str(target_fps)
-            max_patches = min(5, len(best_candidates))  # Patch top 5 at most
-
-            self._log(f"Step 4: Patching top {max_patches} candidates to {fps_label}...")
-
-            for i, (addr, score, module) in enumerate(best_candidates[:max_patches]):
-                self._log(f"  Patching 0x{addr:X} (score: {score}, module: {module})...")
-                if self.write_memory(handle, addr, target_bytes):
-                    total_patched += 1
-                    self._log(f"    ✅ Patched successfully")
-                else:
-                    self._log(f"    ❌ Failed to write")
-
-            if total_patched > 0:
-                return PatchResult(
-                    True,
-                    f"FPS patched to {fps_label}! "
-                    f"({total_patched}/{max_patches} addresses patched)",
-                    addresses_found=total_found,
-                    addresses_patched=total_patched
-                )
-            else:
-                return PatchResult(
-                    False,
-                    "Found candidates but failed to write to memory. "
-                    "Try running as Administrator.",
-                    addresses_found=total_found
-                )
-
-        finally:
-            kernel32.CloseHandle(handle)
-            self._log("  Process handle closed")
